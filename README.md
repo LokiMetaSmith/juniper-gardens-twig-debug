@@ -27,5 +27,7 @@
 * Manually implemented the spec and wrote it to the device via a low-level tool
 
 ## Things we need to do
-- Write the checksum on the packet
-- Deal with ssid+password > 20 bytes
+- [x] Write the checksum on the packet
+- [x] Deal with ssid+password > 20 bytes (multi-packet BLE reassembly)
+- [x] Send RPC result with redirect URL
+- [x] Support IDENTIFY command and capabilities

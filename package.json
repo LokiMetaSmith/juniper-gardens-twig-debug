@@ -1,0 +1,16 @@
+{
+  "name": "improv-wifi-mod-root",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Improv Wi-Fi BLE standard implementation for Moddable SDK",
+  "scripts": {
+    "test": "node --test test/*.js"
+  },
+  "keywords": [
+    "improv-wifi",
+    "ble",
+    "moddable"
+  ],
+  "author": "",
+  "license": "MIT"
+}

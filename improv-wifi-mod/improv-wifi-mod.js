@@ -2,6 +2,8 @@ import BLEServer from "bleserver";
 import GAP from 'gap';
 import { uuid } from "btutils";
 import BLEExports from './consts';
+import { PacketBuffer, parseWifiSettings, buildRpcResult, isValidPacket } from './packet';
+
 const StateCodes = BLEExports.StateCodes;
 const ErrorCodes = BLEExports.ErrorCodes;
 const Commands = BLEExports.Commands;
@@ -9,23 +11,31 @@ const Commands = BLEExports.Commands;
 // FYI class definition for BLEServer can be found @ <moddable-project-dir>/modules/network/ble/bleserver.js
 export default class ImprovWifi extends BLEServer {
     deviceName;
-    ssid;
     state;
     error;
     stateCharacteristic;
     errorCharacteristic;
     rpcCharacteristic;
     onCredentialsRecieved;
-    notify;
-    constructor({ deviceName, onCredentialsRecieved }) {
+    onIdentify;
+    redirectUrl;
+    rpcResultValue;
+    packetBuffer;
+
+    constructor({ deviceName, onCredentialsRecieved, onIdentify, redirectUrl = "" }) {
         super();
         this.deviceName = deviceName;
         this.state = StateCodes.STATE_AUTHORIZED;
         this.error = ErrorCodes.ERROR_NONE;
         this.onCredentialsRecieved = onCredentialsRecieved;
+        this.onIdentify = onIdentify;
+        this.redirectUrl = redirectUrl;
+        this.rpcResultValue = null;
+        this.packetBuffer = new PacketBuffer();
     }
+
     startImprov() {
-        trace("Starting Improv\n");
+        if (typeof trace !== "undefined") trace("Starting Improv\n");
         let advertisingData = {
             flags: GAP.ADFlag.LE_GENERAL_DISCOVERABLE_MODE,
             completeUUID128List: [uuid `00467768-6228-2272-4663-277478268000`],
@@ -34,38 +44,52 @@ export default class ImprovWifi extends BLEServer {
         };
         this.startAdvertising({ advertisingData });
     }
+
     onDisconnected() {
-        trace("Disconnected\n");
+        if (typeof trace !== "undefined") trace("Disconnected\n");
         this.state = StateCodes.STATE_AUTHORIZED;
         this.error = ErrorCodes.ERROR_NONE;
         this.errorCharacteristic = null;
         this.stateCharacteristic = null;
+        this.rpcCharacteristic = null;
+        this.rpcResultValue = null;
+        this.packetBuffer.reset();
         this.startImprov();
     }
+
     onReady() {
-        trace("Ready\n");
+        if (typeof trace !== "undefined") trace("Ready\n");
         this.startImprov();
     }
+
     onCharacteristicRead(characteristic) {
-        trace(`Read: ${JSON.stringify(characteristic)}\n`);
-        switch(characteristic.name){
+        if (typeof trace !== "undefined") trace(`Read: ${JSON.stringify(characteristic)}\n`);
+        switch (characteristic.name) {
             case "ERROR":
                 return this.error;
             case "STATE":
-            case "RPC_RESULT":
                 return this.state;
+            case "RPC_RESULT":
+                return this.rpcResultValue !== null ? this.rpcResultValue : this.state;
+            case "CAPABILITIES":
+                // Bit 0 = identify supported (1 if onIdentify callback is provided, else 1 default)
+                return 0x01;
             default:
-                trace(`I have no idea what ${characteristic.name} is supposed to be`)
-                return this.error
+                if (typeof trace !== "undefined") trace(`I have no idea what ${characteristic.name} is supposed to be\n`);
+                return this.error;
         }
     }
+
     onConnected() {
-        trace("Connected\n");
+        if (typeof trace !== "undefined") trace("Connected\n");
         this.state = StateCodes.STATE_AUTHORIZED;
         this.error = ErrorCodes.ERROR_NONE;
+        this.rpcResultValue = null;
+        this.packetBuffer.reset();
     }
+
     onCharacteristicNotifyDisabled(characteristic) {
-        trace('onCharacteristicNotifyDisabled\n');
+        if (typeof trace !== "undefined") trace('onCharacteristicNotifyDisabled\n');
         switch (characteristic.name) {
             case 'STATE':
                 this.stateCharacteristic = null;
@@ -84,9 +108,9 @@ export default class ImprovWifi extends BLEServer {
                 break;
         }
     }
+
     onCharacteristicNotifyEnabled(characteristic) {
-        trace(`onCharacteristicNotifyEnabled: characteristic: ${characteristic.name} \n`);
-        this.notify = characteristic;
+        if (typeof trace !== "undefined") trace(`onCharacteristicNotifyEnabled: characteristic: ${characteristic.name} \n`);
         switch (characteristic.name) {
             case 'STATE':
                 this.stateCharacteristic = characteristic;
@@ -94,15 +118,18 @@ export default class ImprovWifi extends BLEServer {
                 break;
             case 'ERROR':
                 this.errorCharacteristic = characteristic;
-                this.notifyValue(this.notify, this.error);
+                this.notifyError();
                 break;
             case 'RPC_COMMAND':
                 break;
             case 'RPC_RESULT':
                 this.rpcCharacteristic = characteristic;
+                if (this.rpcResultValue) {
+                    this.notifyRpcResult();
+                }
                 break;
             case 'CAPABILITIES':
-                this.notifyValue(this.notify, 0x01);
+                this.notifyValue(characteristic, 0x01);
                 break;
             default:
                 this.error = ErrorCodes.ERROR_UNKNOWN;
@@ -110,77 +137,144 @@ export default class ImprovWifi extends BLEServer {
                 break;
         }
     }
+
     onCharacteristicWritten(characteristic, value) {
-        // 010a07446f70706c6572096d6f666f7332303130
-        trace(`Written: ${characteristic.name}, in state ${characteristic.state}, with value ${value}, value[0] is ${value?.[0]}, which is a type ${typeof value?.[0]} \n`);
-        // this is where we go and update state again if necessary
+        if (typeof trace !== "undefined") {
+            trace(`Written: ${characteristic.name}, in state ${this.state}, with value ${value}\n`);
+        }
         switch (characteristic.name) {
             case "RPC_COMMAND":
-                this.ssid = value;
-                if (value[0] === Commands.WIFI_SETTINGS) {
-                    trace("Handling wifi settings\n");
-                    this.state = StateCodes.STATE_PROVISIONING;
-                    this.notifyState();
-                    this.handleInboundWifiSettings(value);
-                }
-                else {
-                    this.error = ErrorCodes.ERROR_UNKNOWN_RPC;
-                    this.notifyError();
-                }
+                this.handleRpcCommandChunk(value);
                 break;
             default:
                 this.error = ErrorCodes.ERROR_UNKNOWN;
-                this.notifyState();
+                this.notifyError();
                 break;
         }
     }
-    handleInboundWifiSettings(data) {
-        trace("Handling inbound wifi settings\n");
-        const ssid_length = data[2];
-        const ssid_start = 3;
-        const ssid_end = ssid_start + ssid_length;
-        const pass_length = data[ssid_end];
-        const pass_start = ssid_end + 1;
-        const pass_end = pass_start + pass_length;
-        const ssid = this.buildValue(data, ssid_start, ssid_end);
-        const password = this.buildValue(data, pass_start, pass_end);
-        let result = this.onCredentialsRecieved({ ssid, password });
-        trace(`Result of onCredentialsRecieved is ${result}\n`);
-        if (!result) {
-            trace("Credentials weren't authorized :( \n");
-            this.state = StateCodes.ERROR_UNKNOWN;
-            this.error = ErrorCodes.ERROR_NOT_AUTHORIZED;
+
+    handleRpcCommandChunk(chunk) {
+        const feedResult = this.packetBuffer.feed(chunk);
+        if (feedResult === 'INCOMPLETE') {
+            if (typeof trace !== "undefined") trace("Buffering partial RPC packet chunk\n");
+            return;
+        }
+
+        if (feedResult === 'INVALID') {
+            if (typeof trace !== "undefined") trace("Invalid RPC packet or checksum error\n");
+            this.packetBuffer.reset();
+            this.error = ErrorCodes.ERROR_INVALID_RPC;
             this.notifyError();
             return;
-
         }
-        trace("Credentials were authorized :) \n");
+
+        const fullPacket = this.packetBuffer.getPacket();
+        this.packetBuffer.reset();
+        this.dispatchRpcCommand(fullPacket);
+    }
+
+    dispatchRpcCommand(packet) {
+        const command = packet[0];
+        switch (command) {
+            case Commands.WIFI_SETTINGS:
+                if (this.state !== StateCodes.STATE_AUTHORIZED) {
+                    if (typeof trace !== "undefined") trace("Received wifi settings while not in authorized state\n");
+                    this.error = ErrorCodes.ERROR_NOT_AUTHORIZED;
+                    this.notifyError();
+                    return;
+                }
+                this.state = StateCodes.STATE_PROVISIONING;
+                this.notifyState();
+                this.handleWifiSettingsPacket(packet);
+                break;
+
+            case Commands.IDENTIFY:
+                this.handleIdentifyPacket(packet);
+                break;
+
+            default:
+                if (typeof trace !== "undefined") trace(`Unknown RPC command: ${command}\n`);
+                this.error = ErrorCodes.ERROR_UNKNOWN_RPC;
+                this.notifyError();
+                break;
+        }
+    }
+
+    handleIdentifyPacket(packet) {
+        if (!isValidPacket(packet)) {
+            this.error = ErrorCodes.ERROR_INVALID_RPC;
+            this.notifyError();
+            return;
+        }
+        if (typeof trace !== "undefined") trace("Handling identify command\n");
+        if (typeof this.onIdentify === "function") {
+            try {
+                this.onIdentify();
+            } catch (e) {
+                if (typeof trace !== "undefined") trace(`onIdentify error: ${e}\n`);
+            }
+        }
+    }
+
+    handleWifiSettingsPacket(packet) {
+        if (typeof trace !== "undefined") trace("Handling wifi settings packet\n");
+        const creds = parseWifiSettings(packet);
+        if (!creds) {
+            if (typeof trace !== "undefined") trace("Failed to parse wifi settings payload\n");
+            this.state = StateCodes.STATE_AUTHORIZED;
+            this.error = ErrorCodes.ERROR_INVALID_RPC;
+            this.notifyState();
+            this.notifyError();
+            return;
+        }
+
+        let result = false;
+        try {
+            result = this.onCredentialsRecieved(creds);
+        } catch (e) {
+            if (typeof trace !== "undefined") trace(`onCredentialsRecieved threw error: ${e}\n`);
+            result = false;
+        }
+
+        if (!result) {
+            if (typeof trace !== "undefined") trace("Credentials were not accepted or connection failed\n");
+            this.state = StateCodes.STATE_AUTHORIZED;
+            this.error = ErrorCodes.ERROR_UNABLE_TO_CONNECT;
+            this.notifyState();
+            this.notifyError();
+            return;
+        }
+
+        if (typeof trace !== "undefined") trace("Credentials authorized and provisioned successfully\n");
+        this.error = ErrorCodes.ERROR_NONE;
         this.state = StateCodes.STATE_PROVISIONED;
         this.notifyState();
+
+        const urlList = this.redirectUrl ? [this.redirectUrl] : [];
+        this.rpcResultValue = buildRpcResult(Commands.WIFI_SETTINGS, urlList);
+        this.notifyRpcResult();
     }
-    buildValue(data, start, end) {
-        trace(`Building value from ${start} to ${end}\n`);
-        let str = '';
-        for (var i = start; i < end; i++) {
-            str += String.fromCharCode(data[i]);
-        }
-        return str;
-    }
+
     notifyState() {
-        trace(`Notifying state: ${this.state}\n`);
-        if (!this.stateCharacteristic)
-            return;
+        if (typeof trace !== "undefined") trace(`Notifying state: ${this.state}\n`);
+        if (!this.stateCharacteristic) return;
         this.notifyValue(this.stateCharacteristic, this.state);
     }
-    notifyError() {
-        trace(`Notifying this characteristic: ${this.errorCharacteristic?.name} this error:  ${this.error}\n`);
-        if (!this.errorCharacteristic)
-            return;
 
+    notifyError() {
+        if (typeof trace !== "undefined") trace(`Notifying error: ${this.error}\n`);
+        if (!this.errorCharacteristic) return;
         this.notifyValue(this.errorCharacteristic, this.error);
     }
+
+    notifyRpcResult() {
+        if (typeof trace !== "undefined") trace(`Notifying RPC Result: ${this.rpcResultValue}\n`);
+        if (!this.rpcCharacteristic || !this.rpcResultValue) return;
+        this.notifyValue(this.rpcCharacteristic, this.rpcResultValue);
+    }
+
     couldNotConnect() {
-        trace("Could not connect\n");
+        if (typeof trace !== "undefined") trace("Could not connect\n");
         this.error = ErrorCodes.ERROR_UNABLE_TO_CONNECT;
         this.notifyError();
     }
